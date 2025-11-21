@@ -29,6 +29,37 @@ function Get-CIPPDrift {
         [switch]$AllTenants
     )
 
+
+    $IntuneTable = Get-CippTable -tablename 'templates'
+    $IntuneFilter = "PartitionKey eq 'IntuneTemplate'"
+    $RawIntuneTemplates = (Get-CIPPAzDataTableEntity @IntuneTable -Filter $IntuneFilter)
+    $AllIntuneTemplates = $RawIntuneTemplates | ForEach-Object {
+        try {
+            $JSONData = $_.JSON | ConvertFrom-Json -Depth 100 -ErrorAction SilentlyContinue
+            $data = $JSONData.RAWJson | ConvertFrom-Json -Depth 100 -ErrorAction SilentlyContinue
+            $data | Add-Member -NotePropertyName 'displayName' -NotePropertyValue $JSONData.Displayname -Force
+            $data | Add-Member -NotePropertyName 'description' -NotePropertyValue $JSONData.Description -Force
+            $data | Add-Member -NotePropertyName 'Type' -NotePropertyValue $JSONData.Type -Force
+            $data | Add-Member -NotePropertyName 'GUID' -NotePropertyValue $_.RowKey -Force
+            $data
+        } catch {
+            # Skip invalid templates
+        }
+    } | Sort-Object -Property displayName
+
+    # Load all CA templates
+    $CAFilter = "PartitionKey eq 'CATemplate'"
+    $RawCATemplates = (Get-CIPPAzDataTableEntity @IntuneTable -Filter $CAFilter)
+    $AllCATemplates = $RawCATemplates | ForEach-Object {
+        try {
+            $data = $_.JSON | ConvertFrom-Json -Depth 100 -ErrorAction SilentlyContinue
+            $data | Add-Member -NotePropertyName 'GUID' -NotePropertyValue $_.RowKey -Force
+            $data
+        } catch {
+            # Skip invalid templates
+        }
+    } | Sort-Object -Property displayName
+
     try {
         $AlignmentData = Get-CIPPTenantAlignment -TenantFilter $TenantFilter -TemplateId $TemplateId | Where-Object -Property standardType -EQ 'drift'
         if (-not $AlignmentData) {
@@ -64,16 +95,41 @@ function Get-CIPPDrift {
                         } else {
                             'New'
                         }
+                        # Reset displayName and description for each deviation to prevent carryover from previous iterations
+                        $displayName = $null
+                        $standardDescription = $null
+                        #if the $ComparisonItem.StandardName contains *intuneTemplate*, then it's an Intune policy deviation, and we need to grab the correct displayname from the template table
+                        if ($ComparisonItem.StandardName -like '*intuneTemplate*') {
+                            $CompareGuid = $ComparisonItem.StandardName.Split('.') | Select-Object -Index 2
+                            Write-Host "Extracted GUID: $CompareGuid"
+                            $Template = $AllIntuneTemplates | Where-Object { $_.GUID -like "*$CompareGuid*" }
+                            if ($Template) {
+                                $displayName = $Template.displayName
+                                $standardDescription = $Template.description
+                            }
+                        }
+                        # Handle Conditional Access templates
+                        if ($ComparisonItem.StandardName -like '*ConditionalAccessTemplate*') {
+                            $CompareGuid = $ComparisonItem.StandardName.Split('.') | Select-Object -Index 2
+                            Write-Host "Extracted CA GUID: $CompareGuid"
+                            $Template = $AllCATemplates | Where-Object { $_.GUID -like "*$CompareGuid*" }
+                            if ($Template) {
+                                $displayName = $Template.displayName
+                                $standardDescription = $Template.description
+                            }
+                        }
                         $reason = if ($ExistingDriftStates.ContainsKey($ComparisonItem.StandardName)) { $ExistingDriftStates[$ComparisonItem.StandardName].Reason }
                         $User = if ($ExistingDriftStates.ContainsKey($ComparisonItem.StandardName)) { $ExistingDriftStates[$ComparisonItem.StandardName].User }
                         $StandardsDeviations.Add([PSCustomObject]@{
-                                standardName      = $ComparisonItem.StandardName
-                                expectedValue     = 'Compliant'
-                                receivedValue     = $ComparisonItem.StandardValue
-                                state             = 'current'
-                                Status            = $Status
-                                Reason            = $reason
-                                lastChangedByUser = $User
+                                standardName        = $ComparisonItem.StandardName
+                                standardDisplayName = $displayName
+                                standardDescription = $standardDescription
+                                expectedValue       = 'Compliant'
+                                receivedValue       = $ComparisonItem.StandardValue
+                                state               = 'current'
+                                Status              = $Status
+                                Reason              = $reason
+                                lastChangedByUser   = $User
                             })
                     }
                 }
@@ -177,14 +233,6 @@ function Get-CIPPDrift {
             # Get actual CA templates from templates table
             if ($CATemplateIds.Count -gt 0) {
                 try {
-                    $CATable = Get-CippTable -tablename 'templates'
-                    $CAFilter = "PartitionKey eq 'CATemplate'"
-                    $AllCATemplates = (Get-CIPPAzDataTableEntity @CATable -Filter $CAFilter) | ForEach-Object {
-                        $data = $_.JSON | ConvertFrom-Json -Depth 100
-                        $data | Add-Member -NotePropertyName 'GUID' -NotePropertyValue $_.GUID -Force
-                        $data
-                    } | Sort-Object -Property displayName
-
                     $TemplateCATemplates = $AllCATemplates | Where-Object { $_.GUID -in $CATemplateIds }
                 } catch {
                     Write-Warning "Failed to get CA templates: $($_.Exception.Message)"
@@ -194,22 +242,6 @@ function Get-CIPPDrift {
             # Get actual Intune templates from templates table
             if ($IntuneTemplateIds.Count -gt 0) {
                 try {
-                    $IntuneTable = Get-CippTable -tablename 'templates'
-                    $IntuneFilter = "PartitionKey eq 'IntuneTemplate'"
-                    $RawIntuneTemplates = (Get-CIPPAzDataTableEntity @IntuneTable -Filter $IntuneFilter)
-                    $AllIntuneTemplates = $RawIntuneTemplates | ForEach-Object {
-                        try {
-                            $JSONData = $_.JSON | ConvertFrom-Json -Depth 100 -ErrorAction SilentlyContinue
-                            $data = $JSONData.RAWJson | ConvertFrom-Json -Depth 100 -ErrorAction SilentlyContinue
-                            $data | Add-Member -NotePropertyName 'displayName' -NotePropertyValue $JSONData.Displayname -Force
-                            $data | Add-Member -NotePropertyName 'description' -NotePropertyValue $JSONData.Description -Force
-                            $data | Add-Member -NotePropertyName 'Type' -NotePropertyValue $JSONData.Type -Force
-                            $data | Add-Member -NotePropertyName 'GUID' -NotePropertyValue $_.RowKey -Force
-                            $data
-                        } catch {
-                            # Skip invalid templates
-                        }
-                    } | Sort-Object -Property displayName
 
                     $TemplateIntuneTemplates = $AllIntuneTemplates | Where-Object { $_.GUID -in $IntuneTemplateIds }
                 } catch {
@@ -222,7 +254,6 @@ function Get-CIPPDrift {
                 $PolicyFound = $false
                 $tenantPolicy.policy | Add-Member -MemberType NoteProperty -Name 'URLName' -Value $TenantPolicy.Type -Force
                 $TenantPolicyName = if ($TenantPolicy.Policy.displayName) { $TenantPolicy.Policy.displayName } else { $TenantPolicy.Policy.name }
-
                 foreach ($TemplatePolicy in $TemplateIntuneTemplates) {
                     $TemplatePolicyName = if ($TemplatePolicy.displayName) { $TemplatePolicy.displayName } else { $TemplatePolicy.name }
 
